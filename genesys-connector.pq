@@ -50,7 +50,7 @@ GenesysNavTableType = type function (
     ])
 ) as table meta [
     Documentation.Name = "Genesys Cloud",
-    Documentation.LongDescription = "Connects to the Genesys Cloud Analytics API and returns conversation interaction detail for the selected date range."
+    Documentation.LongDescription = "Connects to the Genesys Cloud Analytics API and returns Interactions (conversation detail) and Queue (interval performance) data for the selected date range."
 ];
 
 GenesysNavTable = (Region as text, optional StartDate as date, optional EndDate as date) as table =>
@@ -58,7 +58,8 @@ GenesysNavTable = (Region as text, optional StartDate as date, optional EndDate 
         objects = #table(
             {"Name", "Key", "Data", "ItemKind", "ItemName", "IsLeaf"},
             {
-                {"Interactions", "Interactions", GetInteractions(Region, StartDate, EndDate), "Table", "Table", true}
+                {"Interactions", "Interactions", GetInteractions(Region, StartDate, EndDate), "Table", "Table", true},
+                {"Queue", "Queue", GetQueue(Region, StartDate, EndDate), "Table", "Table", true}
             }
         ),
         NavTable = Table.ToNavigationTable(objects, {"Key"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
@@ -184,6 +185,176 @@ FlattenConversations = (Conversations as list) as table =>
         )
     in
         SegmentFields;
+
+// ===========================================================================
+// Queue (interval aggregate) query
+// ===========================================================================
+
+// One row per Queue x Media Type x interval bucket. Built from
+// /analytics/conversations/aggregates/query, whose "t*" metrics report
+// {count, sum, min, max} in MILLISECONDS (count doubles as the occurrence
+// count for that state - e.g. tAnswered.count is the number answered) and
+// whose "n*" counters report their total via .count. oServiceLevel is an
+// objective-type metric reporting .ratio/.target rather than count/sum.
+// Service Level % and Transfer are the least certain mappings here - verify
+// them against a known-good report in your tenant before trusting them.
+QueueGranularity = "PT30M";
+
+QueueMetrics = {
+    "nOffered", "tAnswered", "tAbandon", "tHandle", "tTalk", "tHeld", "tAcw", "tWait",
+    "oServiceLevel", "nBlindTransferred", "nConsultTransferred"
+};
+
+QueueColumns = {
+    "QueueId", "MediaType", "Interval",
+    "Offer", "Answer", "Answer %", "Abandon", "Abandon %", "ASA",
+    "Service Level %", "Service Level Target %",
+    "Avg Wait", "Avg Handle", "Avg Talk", "Avg Hold", "Avg ACW",
+    "Hold", "Transfer"
+};
+
+GetQueue = (Region as text, optional StartDate as date, optional EndDate as date) as table =>
+    let
+        Domain = Region,
+        Token = GetToken(Domain),
+
+        _EndDate = if EndDate <> null then EndDate else Date.From(DateTimeZone.UtcNow()),
+        _StartDate = if StartDate <> null then StartDate else Date.AddDays(_EndDate, -7),
+
+        DayCount = Duration.Days(_EndDate - _StartDate) + 1,
+        Days = List.Dates(_StartDate, DayCount, #duration(1, 0, 0, 0)),
+
+        DayResults = List.Transform(
+            Days,
+            each QueueAggregatesForDay(Domain, Token, DateTime.From(_), DateTime.From(_) + #duration(1, 0, 0, 0))
+        ),
+        AllRows = List.Combine(DayResults),
+
+        AsTable = Table.FromRecords(AllRows, QueueColumns, MissingField.UseNull),
+        SplitInterval = Table.SplitColumn(AsTable, "Interval", Splitter.SplitTextByDelimiter("/"), {"Interval Start", "Interval End"}),
+
+        WithQueueNames = Table.NestedJoin(SplitInterval, {"QueueId"}, QueueNameMap(Domain, Token), {"QueueId"}, "QueueLookup", JoinKind.LeftOuter),
+        ExpandQueue = Table.ExpandTableColumn(WithQueueNames, "QueueLookup", {"QueueName"}, {"QueueName"}),
+
+        Typed = Table.TransformColumnTypes(ExpandQueue, {
+            {"Interval Start", type datetimezone},
+            {"Interval End", type datetimezone},
+            {"MediaType", type text},
+            {"QueueId", type text},
+            {"QueueName", type text},
+            {"Offer", Int64.Type},
+            {"Answer", Int64.Type},
+            {"Answer %", type number},
+            {"Abandon", Int64.Type},
+            {"Abandon %", type number},
+            {"ASA", type duration},
+            {"Service Level %", type number},
+            {"Service Level Target %", type number},
+            {"Avg Wait", type duration},
+            {"Avg Handle", type duration},
+            {"Avg Talk", type duration},
+            {"Avg Hold", type duration},
+            {"Avg ACW", type duration},
+            {"Hold", Int64.Type},
+            {"Transfer", Int64.Type}
+        }),
+
+        WithIntervalComplete = Table.AddColumn(
+            Typed, "Interval Complete",
+            each [#"Interval End"] <> null and [#"Interval End"] <= DateTimeZone.UtcNow(),
+            type logical
+        ),
+
+        Reordered = Table.ReorderColumns(WithIntervalComplete, {
+            "Interval Start", "Interval End", "Interval Complete", "MediaType", "QueueId", "QueueName",
+            "Offer", "Answer", "Answer %", "Abandon", "Abandon %", "ASA",
+            "Service Level %", "Service Level Target %",
+            "Avg Wait", "Avg Handle", "Avg Talk", "Avg Hold", "Avg ACW", "Hold", "Transfer"
+        })
+    in
+        Reordered;
+
+// One /aggregates/query call for a UTC day, flattened to one record per
+// Queue x Media Type x interval bucket.
+QueueAggregatesForDay = (Domain as text, Token as text, DayStart as datetime, DayEnd as datetime) as list =>
+    let
+        Interval = DateTime.ToText(DayStart, "yyyy-MM-ddTHH:mm:ss") & ".000Z/" & DateTime.ToText(DayEnd, "yyyy-MM-ddTHH:mm:ss") & ".000Z",
+
+        Response = ApiRequest(Domain, Token, "/api/v2/analytics/conversations/aggregates/query", [
+            interval = Interval,
+            granularity = QueueGranularity,
+            timeZone = "UTC",
+            groupBy = {"queueId", "mediaType"},
+            metrics = QueueMetrics
+        ]),
+        Results = Response[results]? ?? {}
+    in
+        List.Combine(List.Transform(Results, each FlattenQueueGroup(_[group], _[data])));
+
+FlattenQueueGroup = (Group as record, DataList as list) as list =>
+    List.Transform(
+        DataList,
+        each
+            let
+                Bucket = _,
+                Metrics = Bucket[metrics]? ?? {},
+
+                OfferCount = MetricField(Metrics, "nOffered", "count"),
+                AnswerCount = MetricField(Metrics, "tAnswered", "count"),
+                AnswerSum = MetricField(Metrics, "tAnswered", "sum"),
+                AbandonCount = MetricField(Metrics, "tAbandon", "count"),
+                HandleSum = MetricField(Metrics, "tHandle", "sum"),
+                HandleCount = MetricField(Metrics, "tHandle", "count"),
+                TalkSum = MetricField(Metrics, "tTalk", "sum"),
+                TalkCount = MetricField(Metrics, "tTalk", "count"),
+                HeldSum = MetricField(Metrics, "tHeld", "sum"),
+                HeldCount = MetricField(Metrics, "tHeld", "count"),
+                AcwSum = MetricField(Metrics, "tAcw", "sum"),
+                AcwCount = MetricField(Metrics, "tAcw", "count"),
+                WaitSum = MetricField(Metrics, "tWait", "sum"),
+                WaitCount = MetricField(Metrics, "tWait", "count"),
+                SlaRatio = MetricField(Metrics, "oServiceLevel", "ratio"),
+                SlaTarget = MetricField(Metrics, "oServiceLevel", "target"),
+                BlindTransfers = MetricField(Metrics, "nBlindTransferred", "count"),
+                ConsultTransfers = MetricField(Metrics, "nConsultTransferred", "count")
+            in
+                [
+                    QueueId = Record.FieldOrDefault(Group, "queueId", null),
+                    MediaType = Record.FieldOrDefault(Group, "mediaType", null),
+                    Interval = Bucket[interval]?,
+                    Offer = OfferCount,
+                    Answer = AnswerCount,
+                    #"Answer %" = SafeRatio(AnswerCount, OfferCount),
+                    Abandon = AbandonCount,
+                    #"Abandon %" = SafeRatio(AbandonCount, OfferCount),
+                    ASA = MsToDuration(SafeRatio(AnswerSum, AnswerCount)),
+                    #"Service Level %" = if SlaRatio <> null then SlaRatio * 100 else null,
+                    #"Service Level Target %" = if SlaTarget <> null then SlaTarget * 100 else null,
+                    #"Avg Wait" = MsToDuration(SafeRatio(WaitSum, WaitCount)),
+                    #"Avg Handle" = MsToDuration(SafeRatio(HandleSum, HandleCount)),
+                    #"Avg Talk" = MsToDuration(SafeRatio(TalkSum, TalkCount)),
+                    #"Avg Hold" = MsToDuration(SafeRatio(HeldSum, HeldCount)),
+                    #"Avg ACW" = MsToDuration(SafeRatio(AcwSum, AcwCount)),
+                    Hold = HeldCount,
+                    Transfer = (if BlindTransfers <> null then BlindTransfers else 0) + (if ConsultTransfers <> null then ConsultTransfers else 0)
+                ]
+    );
+
+// Finds one named metric in an AggregateMetricData list and reads one field
+// (count/sum/min/max/ratio/target/...) out of its stats record.
+MetricField = (Metrics as list, Name as text, Field as text) as nullable number =>
+    let
+        Matches = List.Select(Metrics, each Record.FieldOrDefault(_, "metric", null) = Name),
+        Stats = if List.Count(Matches) > 0 then Matches{0}[stats]? else null
+    in
+        if Stats <> null then Record.FieldOrDefault(Stats, Field, null) else null;
+
+SafeRatio = (Numerator as nullable number, Denominator as nullable number) as nullable number =>
+    if Numerator <> null and Denominator <> null and Denominator <> 0 then Numerator / Denominator else null;
+
+// Genesys reports time-metric stats in milliseconds; convert to an M duration.
+MsToDuration = (Ms as nullable number) as nullable duration =>
+    if Ms = null then null else #duration(0, 0, 0, Ms / 1000);
 
 // ===========================================================================
 // Reference data lookups (Queue name, Wrap-up code name)
