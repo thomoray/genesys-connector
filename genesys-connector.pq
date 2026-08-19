@@ -1,6 +1,6 @@
 // This file contains your Data Connector logic
 [Version = "1.0.0"]
-section genesys-connector;
+section GenesysConnector;
 
 // ===========================================================================
 // Configuration
@@ -31,8 +31,8 @@ PageSize = 100;
 // Exported function
 // ===========================================================================
 
-[DataSource.Kind = "genesys-connector", Publish = "genesys-connector.Publish"]
-shared genesys-connector.Contents = Value.ReplaceType(GenesysNavTable, GenesysNavTableType);
+[DataSource.Kind = "GenesysConnector", Publish = "GenesysConnector.Publish"]
+shared GenesysConnector.Contents = Value.ReplaceType(GenesysNavTable, GenesysNavTableType);
 
 GenesysNavTableType = type function (
     Region as (type text meta [
@@ -225,7 +225,7 @@ GetAllPages = (Domain as text, Token as text, BasePath as text) as list =>
 // ===========================================================================
 
 // OAuth2 client-credentials grant. Client ID / Client Secret are supplied via
-// the connector's UsernamePassword credential (see genesys-connector below) -
+// the connector's UsernamePassword credential (see GenesysConnector below) -
 // set them through the Power Query SDK "Set credential" command or the Power
 // BI Desktop connect dialog, not from this project's .env file (M has no
 // access to process environment variables).
@@ -276,12 +276,12 @@ ApiRequest = (Domain as text, Token as text, Path as text, optional Body as null
 // Data Source Kind / Publish
 // ===========================================================================
 
-genesys-connector = [
+GenesysConnector = [
     TestConnection = (dataSourcePath) =>
         let
             Json = Json.Document(dataSourcePath)
         in
-            {"genesys-connector.Contents", Json[Region]},
+            {"GenesysConnector.Contents", Json[Region]},
     Authentication = [
         UsernamePassword = [
             UsernameLabel = "Client ID",
@@ -292,16 +292,16 @@ genesys-connector = [
 ];
 
 // Data Source UI publishing description
-genesys-connector.Publish = [
+GenesysConnector.Publish = [
     Beta = true,
     Category = "Online Services",
     ButtonText = { Extension.LoadString("ButtonTitle"), Extension.LoadString("ButtonHelp") },
     LearnMoreUrl = "https://developer.genesys.cloud/",
-    SourceImage = genesys-connector.Icons,
-    SourceTypeImage = genesys-connector.Icons
+    SourceImage = GenesysConnector.Icons,
+    SourceTypeImage = GenesysConnector.Icons
 ];
 
-genesys-connector.Icons = [
+GenesysConnector.Icons = [
     Icon16 = { Extension.Contents("genesys-connector16.png"), Extension.Contents("genesys-connector20.png"), Extension.Contents("genesys-connector24.png"), Extension.Contents("genesys-connector32.png") },
     Icon32 = { Extension.Contents("genesys-connector32.png"), Extension.Contents("genesys-connector40.png"), Extension.Contents("genesys-connector48.png"), Extension.Contents("genesys-connector64.png") }
 ];
