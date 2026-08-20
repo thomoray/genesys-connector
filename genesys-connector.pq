@@ -47,19 +47,25 @@ GenesysNavTableType = type function (
     optional EndDate as (type date meta [
         Documentation.FieldCaption = "End Date (UTC)",
         Documentation.FieldDescription = "Last day of conversations to include. Defaults to today (UTC)."
+    ]),
+    optional TimeZone as (type text meta [
+        Documentation.FieldCaption = "Time Zone (ATS only)",
+        Documentation.FieldDescription = "Olson time zone used to define calendar days for the ATS (adherence) report, e.g. Australia/Sydney. Defaults to UTC. Ignored by Interactions/Queue/Quality."
     ])
 ) as table meta [
     Documentation.Name = "Genesys Cloud",
-    Documentation.LongDescription = "Connects to the Genesys Cloud Analytics API and returns Interactions (conversation detail) and Queue (interval performance) data for the selected date range."
+    Documentation.LongDescription = "Connects to the Genesys Cloud Analytics and Workforce Management APIs and returns Interactions (conversation detail), Queue (interval performance), Quality (evaluations), and ATS (historical adherence) data for the selected date range."
 ];
 
-GenesysNavTable = (Region as text, optional StartDate as date, optional EndDate as date) as table =>
+GenesysNavTable = (Region as text, optional StartDate as date, optional EndDate as date, optional TimeZone as text) as table =>
     let
         objects = #table(
             {"Name", "Key", "Data", "ItemKind", "ItemName", "IsLeaf"},
             {
                 {"Interactions", "Interactions", GetInteractions(Region, StartDate, EndDate), "Table", "Table", true},
-                {"Queue", "Queue", GetQueue(Region, StartDate, EndDate), "Table", "Table", true}
+                {"Queue", "Queue", GetQueue(Region, StartDate, EndDate), "Table", "Table", true},
+                {"Quality", "Quality", GetQuality(Region, StartDate, EndDate), "Table", "Table", true},
+                {"ATS", "ATS", GetATS(Region, StartDate, EndDate, TimeZone), "Table", "Table", true}
             }
         ),
         NavTable = Table.ToNavigationTable(objects, {"Key"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
@@ -355,6 +361,321 @@ SafeRatio = (Numerator as nullable number, Denominator as nullable number) as nu
 // Genesys reports time-metric stats in milliseconds; convert to an M duration.
 MsToDuration = (Ms as nullable number) as nullable duration =>
     if Ms = null then null else #duration(0, 0, 0, Ms / 1000);
+
+// ===========================================================================
+// Quality (evaluations) query
+// ===========================================================================
+
+// One row per evaluation, from POST /api/v2/quality/evaluations/query - the
+// dedicated evaluation search endpoint (not the conversation-details
+// endpoint), since it already carries agent/evaluator/assignee, score,
+// status, comments, etc. in one place. Filtered by conversationDate.
+// Average/Highest/Lowest Score from the old CSV export aren't reproduced:
+// they were rollups across many evaluations, and can be rebuilt with a
+// Group By on Agent Id / Evaluation Form Name once this shape is validated.
+QualityColumns = {
+    "Evaluation Id", "Conversation Id", "Agent Id", "Agent Name", "Evaluator", "Assignee",
+    "Evaluation Form Name", "Status", "Score", "Critical Score", "Agent Comments",
+    "Reviewed By Agent", "Media Type", "Interaction Date/Time", "Evaluation Date/Time",
+    "Release Date/Time", "Disputes", "Revisions"
+};
+
+GetQuality = (Region as text, optional StartDate as date, optional EndDate as date) as table =>
+    let
+        Domain = Region,
+        Token = GetToken(Domain),
+
+        _EndDate = if EndDate <> null then EndDate else Date.From(DateTimeZone.UtcNow()),
+        _StartDate = if StartDate <> null then StartDate else Date.AddDays(_EndDate, -7),
+
+        DayCount = Duration.Days(_EndDate - _StartDate) + 1,
+        Days = List.Dates(_StartDate, DayCount, #duration(1, 0, 0, 0)),
+
+        DayResults = List.Transform(
+            Days,
+            each QualityEvaluationsForDay(Domain, Token, DateTime.From(_), DateTime.From(_) + #duration(1, 0, 0, 0))
+        ),
+        AllEvaluations = List.Combine(DayResults),
+
+        Flattened = FlattenEvaluations(AllEvaluations),
+
+        Typed = Table.TransformColumnTypes(Flattened, {
+            {"Evaluation Id", type text},
+            {"Conversation Id", type text},
+            {"Agent Id", type text},
+            {"Agent Name", type text},
+            {"Evaluator", type text},
+            {"Assignee", type text},
+            {"Evaluation Form Name", type text},
+            {"Status", type text},
+            {"Score", type number},
+            {"Critical Score", type number},
+            {"Agent Comments", type text},
+            {"Reviewed By Agent", type logical},
+            {"Media Type", type text},
+            {"Interaction Date/Time", type datetimezone},
+            {"Evaluation Date/Time", type datetimezone},
+            {"Release Date/Time", type datetimezone},
+            {"Disputes", Int64.Type},
+            {"Revisions", Int64.Type}
+        })
+    in
+        Typed;
+
+// Fetches every page of /quality/evaluations/query for one UTC day, filtered
+// to evaluations whose conversation happened that day.
+QualityEvaluationsForDay = (Domain as text, Token as text, DayStart as datetime, DayEnd as datetime) as list =>
+    let
+        StartValue = DateTime.ToText(DayStart, "yyyy-MM-ddTHH:mm:ss") & ".000Z",
+        EndValue = DateTime.ToText(DayEnd, "yyyy-MM-ddTHH:mm:ss") & ".000Z",
+
+        FetchPage = (PageNumber as number) =>
+            ApiRequest(Domain, Token, "/api/v2/quality/evaluations/query", [
+                query = {
+                    [#"type" = "DATE_RANGE", field = "conversationDate", startValue = StartValue, endValue = EndValue]
+                },
+                pageSize = PageSize,
+                pageNumber = PageNumber,
+                sortBy = "conversationDate",
+                sortOrder = "ASC"
+            ]),
+
+        Pages = List.Generate(
+            () => [Page = 1, Response = FetchPage(1)],
+            each [Response][results]? <> null and List.Count([Response][results]) > 0,
+            each [Page = [Page] + 1, Response = FetchPage([Page] + 1)],
+            each [Response][results]?
+        )
+    in
+        List.Combine(Pages);
+
+FlattenEvaluations = (Evaluations as list) as table =>
+    let
+        Records = List.Transform(
+            Evaluations,
+            each
+                let
+                    Item = _,
+                    ConversationRef = Item[conversation]?,
+                    AgentUser = Item[agent]?,
+                    EvaluatorUser = Item[evaluator]?,
+                    AssigneeUser = Item[assignee]?,
+                    FormRef = Item[evaluationForm]?,
+                    AnswerSet = Item[answers]?,
+                    MediaTypeList = Item[mediaType]? ?? {}
+                in
+                    [
+                        #"Evaluation Id" = Item[id]?,
+                        #"Conversation Id" = SafeField(ConversationRef, "id"),
+                        #"Agent Id" = SafeField(AgentUser, "id"),
+                        #"Agent Name" = SafeField(AgentUser, "name"),
+                        Evaluator = SafeField(EvaluatorUser, "name"),
+                        Assignee = SafeField(AssigneeUser, "name"),
+                        #"Evaluation Form Name" = SafeField(FormRef, "latestVersionFormName"),
+                        Status = Item[status]?,
+                        Score = SafeField(AnswerSet, "totalScore"),
+                        #"Critical Score" = SafeField(AnswerSet, "totalCriticalScore"),
+                        #"Agent Comments" = SafeField(AnswerSet, "agentComments"),
+                        #"Reviewed By Agent" = Item[agentHasRead]?,
+                        #"Media Type" = Text.Combine(List.Transform(MediaTypeList, each Text.From(_)), ", "),
+                        #"Interaction Date/Time" = Item[conversationDate]?,
+                        #"Evaluation Date/Time" = Item[submittedDate]?,
+                        #"Release Date/Time" = Item[releaseDate]?,
+                        Disputes = Item[disputeCount]?,
+                        Revisions = Item[version]?
+                    ]
+        )
+    in
+        Table.FromRecords(Records, QualityColumns, MissingField.UseNull);
+
+// Reads a field out of a record that might itself be null (e.g. Assignee is
+// absent when an evaluation has no assignee).
+SafeField = (Rec as nullable record, Name as text) as any =>
+    if Rec = null then null else Record.FieldOrDefault(Rec, Name, null);
+
+// ===========================================================================
+// ATS (historical adherence) query
+// ===========================================================================
+
+// This one is the least validated of the four reports: it's an async,
+// job-based WFM API flow (submit -> poll -> download result file(s)) rather
+// than a simple synchronous query, and I have no live tenant to confirm the
+// download-URL auth behaviour or the managementunits paging shape against.
+// One row per Agent x Management Unit x calendar day, from
+// POST /api/v2/workforcemanagement/adherence/historical/bulk (the current,
+// non-deprecated route - the older /adherence/historical endpoint and the
+// managementunits/{id}/historicaladherencequery route were both replaced by
+// this one in April 2024). "Date" is derived from each result's startDate
+// plus that day's dayStartOffsetSeconds.
+// KNOWN LIMITATION: Genesys computes day boundaries in the requested
+// TimeZone but returns them as UTC timestamps, and M has no Olson-name ->
+// UTC-offset lookup to shift them back. "Date" is only guaranteed correct
+// when TimeZone is left at the default "UTC" (no offset to correct for). A
+// non-UTC TimeZone will get the right adherence numbers but "Date" may be
+// off by one near midnight in that zone - shift it manually downstream if
+// that matters.
+ATSColumns = {
+    "Agent Id", "Management Unit Id", "Date",
+    "Adherence (%)", "Conformance (%)", "Exceptions", "Exceptions Duration (Adherence)",
+    "Scheduled (Adherence)", "Actual Time", "Scheduled On Queue", "Work Time On Queue"
+};
+
+GetATS = (Region as text, optional StartDate as date, optional EndDate as date, optional TimeZone as text) as table =>
+    let
+        Domain = Region,
+        Token = GetToken(Domain),
+
+        _EndDate = if EndDate <> null then EndDate else Date.From(DateTimeZone.UtcNow()),
+        _StartDate = if StartDate <> null then StartDate else Date.AddDays(_EndDate, -7),
+        _TimeZone = if TimeZone <> null then TimeZone else "UTC",
+
+        StartValue = DateTime.ToText(DateTime.From(_StartDate), "yyyy-MM-ddTHH:mm:ss") & ".000Z",
+        EndValue = DateTime.ToText(DateTime.From(_EndDate) + #duration(1, 0, 0, 0), "yyyy-MM-ddTHH:mm:ss") & ".000Z",
+
+        ManagementUnits = ManagementUnitMap(Domain, Token),
+        ManagementUnitIds = Table.Column(ManagementUnits, "ManagementUnitId"),
+
+        Items = List.Transform(ManagementUnitIds, each [
+            managementUnitId = _,
+            startDate = StartValue,
+            endDate = EndValue,
+            includeExceptions = false,
+            includeActuals = false
+        ]),
+
+        SubmitResponse = ApiRequest(Domain, Token, "/api/v2/workforcemanagement/adherence/historical/bulk", [
+            items = Items,
+            timeZone = _TimeZone
+        ]),
+        JobId = NestedField(SubmitResponse, {"job", "id"}),
+        Completed = PollAdherenceJob(Domain, Token, JobId, SubmitResponse),
+        JobStatus = NestedField(Completed, {"job", "status"}),
+
+        DownloadUrls = if JobStatus = "Complete" then Completed[downloadUrls]? ?? {} else
+            error Error.Record(
+                "Genesys.Adherence",
+                "Historical adherence job did not complete (status: " & Text.From(JobStatus ?? "unknown") & ").",
+                Completed
+            ),
+
+        ResultFiles = List.Transform(DownloadUrls, each DownloadJson(_, Token)),
+        Rows = List.Combine(List.Transform(ResultFiles, each FlattenAdherenceResult(_))),
+
+        AsTable = Table.FromRecords(Rows, ATSColumns, MissingField.UseNull),
+
+        WithManagementUnitNames = Table.NestedJoin(AsTable, {"Management Unit Id"}, ManagementUnits, {"ManagementUnitId"}, "MuLookup", JoinKind.LeftOuter),
+        ExpandMu = Table.ExpandTableColumn(WithManagementUnitNames, "MuLookup", {"ManagementUnitName"}, {"Management Unit Name"}),
+
+        WithAgentNames = Table.NestedJoin(ExpandMu, {"Agent Id"}, UserNameMap(Domain, Token), {"AgentId"}, "AgentLookup", JoinKind.LeftOuter),
+        ExpandAgent = Table.ExpandTableColumn(WithAgentNames, "AgentLookup", {"AgentName"}, {"Agent Name"}),
+
+        Typed = Table.TransformColumnTypes(ExpandAgent, {
+            {"Agent Id", type text},
+            {"Agent Name", type text},
+            {"Management Unit Id", type text},
+            {"Management Unit Name", type text},
+            {"Date", type date},
+            {"Adherence (%)", type number},
+            {"Conformance (%)", type number},
+            {"Exceptions", Int64.Type},
+            {"Exceptions Duration (Adherence)", type duration},
+            {"Scheduled (Adherence)", type duration},
+            {"Actual Time", type duration},
+            {"Scheduled On Queue", type duration},
+            {"Work Time On Queue", type duration}
+        }),
+
+        Reordered = Table.ReorderColumns(Typed, {
+            "Agent Id", "Agent Name", "Management Unit Id", "Management Unit Name", "Date",
+            "Adherence (%)", "Conformance (%)", "Exceptions", "Exceptions Duration (Adherence)",
+            "Scheduled (Adherence)", "Actual Time", "Scheduled On Queue", "Work Time On Queue"
+        })
+    in
+        Reordered;
+
+// Polls the bulk job every 3 seconds (up to 60 tries, ~3 minutes) until it
+// reports Complete or Error. Returns immediately if InitialResponse already
+// shows Complete (small ranges can finish before the first response).
+PollAdherenceJob = (Domain as text, Token as text, JobId as nullable text, InitialResponse as any) as any =>
+    let
+        Attempt = (Response as any, TriesLeft as number) as any =>
+            let
+                Status = NestedField(Response, {"job", "status"})
+            in
+                if Status = "Complete" or Status = "Error" or TriesLeft <= 0 or JobId = null then Response
+                else Function.InvokeAfter(
+                    () => @Attempt(ApiRequest(Domain, Token, "/api/v2/workforcemanagement/adherence/historical/bulk/jobs/" & JobId, null), TriesLeft - 1),
+                    #duration(0, 0, 0, 3)
+                )
+    in
+        Attempt(InitialResponse, 60);
+
+// Result-file download URLs may be pre-signed (no auth needed) or may be
+// regular Genesys API URLs (need the bearer token) - try without auth first,
+// fall back to an authenticated GET.
+DownloadJson = (Url as text, Token as text) as any =>
+    try Json.Document(Web.Contents(Url))
+    otherwise Json.Document(Web.Contents(Url, [Headers = [Authorization = "Bearer " & Token]]));
+
+FlattenAdherenceResult = (Result as record) as list =>
+    let
+        ResultStart = Result[startDate]?,
+        BaseDateTime = if ResultStart <> null then DateTimeZone.From(ResultStart) else null,
+        MuId = Result[managementUnitId]?,
+        UserResultsList = Result[userResults]? ?? {}
+    in
+        List.Combine(List.Transform(UserResultsList, each FlattenAdherenceUserResult(_, BaseDateTime, MuId)));
+
+FlattenAdherenceUserResult = (UserResult as record, BaseDateTime as nullable datetimezone, MuId as nullable text) as list =>
+    let
+        UserId = UserResult[userId]?,
+        DayMetricsList = UserResult[dayMetrics]? ?? {}
+    in
+        List.Transform(
+            DayMetricsList,
+            each
+                let
+                    Day = _,
+                    OffsetSeconds = Day[dayStartOffsetSeconds]?,
+                    RowDate = if BaseDateTime <> null and OffsetSeconds <> null then BaseDateTime + #duration(0, 0, 0, OffsetSeconds) else null
+                in
+                    [
+                        #"Agent Id" = UserId,
+                        #"Management Unit Id" = MuId,
+                        Date = RowDate,
+                        #"Adherence (%)" = Day[adherencePercentage]?,
+                        #"Conformance (%)" = Day[conformancePercentage]?,
+                        Exceptions = Day[exceptionCount]?,
+                        #"Exceptions Duration (Adherence)" = SecondsToDuration(Day[exceptionDurationSeconds]?),
+                        #"Scheduled (Adherence)" = SecondsToDuration(Day[adherenceScheduleSeconds]?),
+                        #"Actual Time" = SecondsToDuration(Day[actualLengthSeconds]?),
+                        #"Scheduled On Queue" = SecondsToDuration(Day[conformanceScheduleSeconds]?),
+                        #"Work Time On Queue" = SecondsToDuration(Day[conformanceActualSeconds]?)
+                    ]
+        );
+
+SecondsToDuration = (Seconds as nullable number) as nullable duration =>
+    if Seconds = null then null else #duration(0, 0, 0, Seconds);
+
+// Walks a path of field names, short-circuiting to null the moment a parent
+// is missing or null - [x]?[y]? on its own doesn't do this, since the ?
+// operator only guards a missing field on a record, not indexing into null.
+NestedField = (Rec as any, Path as list) as any =>
+    List.Accumulate(Path, Rec, (State, Key) => if State = null then null else Record.FieldOrDefault(State, Key, null));
+
+ManagementUnitMap = (Domain as text, Token as text) as table =>
+    let
+        Entities = List.Combine(GetAllPages(Domain, Token, "/api/v2/workforcemanagement/managementunits")),
+        AsTable = Table.FromRecords(Entities, {"id", "name"}, MissingField.UseNull)
+    in
+        Table.RenameColumns(AsTable, {{"id", "ManagementUnitId"}, {"name", "ManagementUnitName"}});
+
+UserNameMap = (Domain as text, Token as text) as table =>
+    let
+        Entities = List.Combine(GetAllPages(Domain, Token, "/api/v2/users")),
+        AsTable = Table.FromRecords(Entities, {"id", "name"}, MissingField.UseNull)
+    in
+        Table.RenameColumns(AsTable, {{"id", "AgentId"}, {"name", "AgentName"}});
 
 // ===========================================================================
 // Reference data lookups (Queue name, Wrap-up code name)
